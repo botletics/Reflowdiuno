@@ -3,7 +3,7 @@
  * Author: Timothy Woo
  * Website: www.botletics.com
  * Last modified: 12/1/2017
- * 
+ *
  * -----------------------------------------------------------------------------------------------
  * This is an example sketch for the Reflowduino reflow oven controller board. The default
  * settings in this code is for lead-free solder found in most solder paste, but the parameters
@@ -12,19 +12,19 @@
  * the readings to the Reflowdiuno app. This code can also enable the Reflowduino to automatically
  * enter data points into Excel to graph the data in real time if connected to a computer. Simply
  * uncomment lines 262-268 to enable this feature!
- * 
+ *
  * Order a Reflowduino at https://www.botletics.com/products/reflowduino
  * Full documentation and design resources at https://github.com/botletics/Reflowduino
- * 
+ *
  * -----------------------------------------------------------------------------------------------
  * Credits: Special thanks to all those who have been an invaluable part of the DIY community,
  * like the author of the Arduino PID library and the developers at Adafruit!
- * 
+ *
  * -----------------------------------------------------------------------------------------------
  * License: This code is released under the GNU General Public License v3.0
  * https://choosealicense.com/licenses/gpl-3.0/ and appropriate attribution must be
  * included in all redistributions of this code.
- * 
+ *
  * -----------------------------------------------------------------------------------------------
  * Disclaimer: Dealing with mains voltages is dangerous and potentially life-threatening!
  * If you do not have adequate experience working with high voltages, please consult someone
@@ -51,6 +51,8 @@
 #define BT_TX 10
 #define LED 13 // This LED is used to indicate if the reflow process is underway
 #define MAX_CS 8 // MAX31855 chip select pin
+#define BTN_P2 2
+#define BTN_P3 3
 
 // Initialize Bluetooth software serial
 SoftwareSerial BT = SoftwareSerial(BT_TX,BT_RX); // Reflowduino (RX, TX), Bluetooth (TX, RX)
@@ -64,7 +66,7 @@ Adafruit_MAX31855 thermocouple(MAX_CS);
 
 // Define reflow temperature profile parameters (in *C)
 // First define a subtraction constant to compensate for overshoot:
-#define T_const 5 // From testing, overshoot was about 5-6*C
+#define T_const 1 // From testing, overshoot was about 5-6*C
 
 // Standard lead-free solder paste (melting point around 215*C)
 //#define T_preheat 150
@@ -72,9 +74,18 @@ Adafruit_MAX31855 thermocouple(MAX_CS);
 //#define T_reflow 249 - T_const
 
 // "Low-temp" lead-free solder paste (melting point around 138*C)
-#define T_preheat 90
-#define T_soak 138
-#define T_reflow 165 - T_const
+//#define T_preheat 90
+//#define T_soak 138
+//#define T_reflow 165 - T_const
+
+// Superior Solder 8013-85 Water Soluble
+#define T_preheat 120
+#define T_soak 150
+#define soak_time 50*1000
+#define T_reflow_a 180 - T_const
+#define reflow_a_time 50*1000
+#define T_reflow_b 220 - T_const
+#define reflow_b_time 20*1000
 
 // Test values to make sure your Reflowduino is actually working
 //#define T_preheat 50
@@ -108,6 +119,8 @@ Adafruit_MAX31855 thermocouple(MAX_CS);
 #define stopChar '!' // App is receiving command to stop reflow process (process finished!)
 #define startReflow 'A' // Command from app to "activate" reflow process
 #define stopReflow 'S' // Command from app to "stop" reflow process at any time
+enum STATE{idle,preheat,soak,reflowA,reflowB,cool};
+enum STATE currState = idle; // {idle,preheat,soak,reflowA,reflowB,cool};
 
 double temperature, output, setPoint; // Input, output, set point
 PID myPID(&temperature, &output, &setPoint, Kp_preheat, Ki_preheat, Kd_preheat, DIRECT);
@@ -127,10 +140,16 @@ int noteDurations[] = {4, 8, 8, 4, 4, 4, 4, 4};
 
 // Logic flags
 bool justStarted = true;
-bool reflow = false; // Baking process is underway!
+volatile bool reflow = false; // Baking process is underway!
+volatile bool buttonPressed = false;
+volatile unsigned long lastButtonPress = 0;
+#define BUTTON_DEBOUNCE_MSEC 100
+
 bool preheatComplete = false;
+bool stageWait = false;
 bool soakComplete = false;
-bool reflowComplete = false;
+bool reflowAComplete = false;
+bool reflowBComplete = false;
 bool coolComplete = false;
 
 double T_start; // Starting temperature before reflow process
@@ -138,15 +157,23 @@ int windowSize = 2000;
 unsigned long sendRate = 2000; // Send data to app every 2s
 unsigned long t_start = 0; // For keeping time during reflow process
 unsigned long previousMillis = 0;
+unsigned long previousDebugMillis = 0;
+
 unsigned long duration, t_final, windowStartTime, timer;
 
 void setup() {
   Serial.begin(9600); // This should be different from the Bluetooth baud rate
   BT.begin(57600);
+  delay(10); // wait a bit before initting
 
   pinMode(buzzer, OUTPUT);
   pinMode(LED, OUTPUT);
   pinMode(relay, OUTPUT);
+
+  digitalWrite(BTN_P2, INPUT_PULLUP);
+  digitalWrite(BTN_P3, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(BTN_P2), buttonPress, FALLING);
+  attachInterrupt(digitalPinToInterrupt(BTN_P3), buttonPress, FALLING);
 
   digitalWrite(LED, LOW);
   digitalWrite(relay, LOW); // Set default relay state to OFF
@@ -155,29 +182,53 @@ void setup() {
   myPID.SetSampleTime(PID_sampleTime);
   myPID.SetMode(AUTOMATIC); // Turn on PID control
 
-//   while (!Serial) delay(1); // OPTIONAL: Wait for serial to connect
+  //while (!Serial) delay(1); // OPTIONAL: Wait for serial to connect
   Serial.println("*****Reflowduino demo*****");
 
   if (enableKeyboard) Keyboard.begin(); // Only if you want to type data into Excel
+  reflow = false;
+  buttonPressed = false;
 }
 
+void buttonPress() {
+  buttonPressed = true;
+}
+
+
 void loop() {
+
+  if (buttonPressed && (millis() - lastButtonPress) > BUTTON_DEBOUNCE_MSEC) {
+    lastButtonPress = millis();
+    justStarted = true;
+    buttonPressed = false;
+    reflow = true;
+    Serial.println("*********************** button pressed ******************************");
+  }
+
+  bool printThisLoop = false;
+  if (millis() - previousDebugMillis > sendRate) {
+    previousDebugMillis = millis();
+    printThisLoop = true;
+  }
+
   /***************************** MEASURE TEMPERATURE *****************************/
   temperature = thermocouple.readCelsius(); // Read temperature
 //  temperature = thermocouple.readFarenheit(); // Alternatively, read in deg F but will need to modify code
-  
+
   /***************************** REFLOW PROCESS CODE *****************************/
   if (reflow) {
     digitalWrite(LED, HIGH); // Red LED indicates reflow is underway
 
     // This only runs when you first start the reflow process
     if (justStarted) {
+      currState = idle; // {idle,preheat,soak,reflowA,reflowB,cool};
+
       justStarted = false;
-      
+
       t_start = millis(); // Begin timers
       windowStartTime = millis();
       T_start = temperature;
-      
+
       if (isnan(T_start)) {
        Serial.println("Invalid reading, check thermocouple!");
       }
@@ -195,8 +246,12 @@ void loop() {
     // Perform a linear extrapolation of what desired temperature we want to be at.
     /********************* PREHEAT *********************/
     if (!preheatComplete) {
+      currState = preheat; // ,soak,reflowA,reflowB,cool};
+
       if (temperature >= T_preheat) { // Check if the current phase was just completed
         preheatComplete = true;
+        currState = soak; // ,soak,reflowA,reflowB,cool};
+
         t_start = millis(); // Reset timer for next phase
         Serial.println("Preheat phase complete!");
       }
@@ -205,31 +260,103 @@ void loop() {
         t_final = (T_preheat - T_start) / preheat_rate + t_start;
         // Calculate desired temperature at that instant in time using linear interpolation
         setPoint = duration * (T_preheat - T_start) / (t_final - t_start);
+        if (false && printThisLoop) {
+          Serial.print("preheat set temp: ");
+          Serial.println(setPoint);
+        }
       }
     }
     /********************* SOAK *********************/
     else if (!soakComplete) {
-      if (temperature >= T_soak) {
-        soakComplete = true;
+      currState = soak; // ,soak,reflowA,reflowB,cool};
+
+      if (!stageWait && temperature >= T_soak) {
+        stageWait = true; // start the timer
+        //soakComplete = true;
         t_start = millis();
-        Serial.println("Soaking phase complete!");
+        Serial.println("Soaking phase starting!");
       }
       else {
         t_final = (T_soak - T_start) / soak_rate + t_start;
         setPoint = duration * (T_soak - T_start) / (t_final - t_start);
+        if (false && printThisLoop) {
+          Serial.print("soak set temp: ");
+          Serial.println(t_final);
+        }
+      }
+
+              if (printThisLoop) {
+        Serial.print("soak duration: ");
+        Serial.println(duration);
+        }
+
+      if (!soakComplete && stageWait) {
+        if (duration > soak_time) {
+          currState = reflowA; // ,soak,reflowA,reflowB,cool};
+          soakComplete = true;
+          stageWait = false;
+          Serial.println("Soaking phase completed.");
+        }
       }
     }
-    /********************* REFLOW *********************/
-    else if (!reflowComplete) {
-      if (temperature >= T_reflow) {
-        reflowComplete = true;
+    /********************* REFLOW A *********************/
+    else if (!reflowAComplete) {
+      currState = reflowA; // ,soak,reflowA,reflowB,cool};
+
+      if (!stageWait && temperature >= T_reflow_a) {
+        stageWait = true; // start the timer
+        //reflowAComplete = true;
         t_start = millis();
-        Serial.println("Reflow phase complete!");
+        Serial.println("Reflow phase A starting!");
         tone(buzzer, openDoorTune, 2000); // Alert the user to open the door!
       }
       else {
-        t_final = (T_reflow - T_start) / reflow_rate + t_start;
-        setPoint = duration * (T_reflow - T_start) / (t_final - t_start);
+        t_final = (T_reflow_a - T_start) / reflow_rate + t_start;
+        setPoint = duration * (T_reflow_a - T_start) / (t_final - t_start);
+        if (false && printThisLoop) {
+          Serial.print("reflowA set temp: ");
+          Serial.println(t_final);
+        }
+      }
+
+      if (!reflowAComplete && stageWait) {
+        Serial.println("Reflow phase A waiting.");
+
+        if (duration > reflow_a_time) {
+          currState = reflowB; // ,soak,reflowA,reflowB,cool};
+          reflowAComplete = true;
+          stageWait = false;
+          Serial.println("Reflow phase A completed.");
+        }
+      }
+    }
+    /********************* REFLOW B *********************/
+    else if (!reflowBComplete) {
+      currState = reflowB; // ,soak,reflowA,reflowB,cool};
+      if (!stageWait && temperature >= T_reflow_b) {
+        stageWait = true; // start the timer
+        //reflowBComplete = true;
+        t_start = millis();
+        Serial.println("Reflow phase B starting!");
+        tone(buzzer, openDoorTune, 2000); // Alert the user to open the door!
+      }
+      else {
+        t_final = (T_reflow_b - T_start) / reflow_rate + t_start;
+        setPoint = duration * (T_reflow_b - T_start) / (t_final - t_start);
+        if (false && printThisLoop) {
+          Serial.print("reflowB set temp: ");
+          Serial.println(t_final);
+        }
+      }
+
+      if (!reflowBComplete && stageWait) {
+        Serial.println("Reflow phase B waiting.");
+        if (duration > reflow_b_time) {
+          currState = cool; // ,soak,reflowA,reflowB,cool};
+          reflowBComplete = true;
+          stageWait = false;
+          Serial.println("Reflow phase B completed.");
+        }
       }
     }
     /********************* COOLDOWN *********************/
@@ -244,13 +371,17 @@ void loop() {
       else {
         t_final = (T_cool - T_start) / cool_rate + t_start;
         setPoint = duration * (T_cool - T_start) / (t_final - t_start);
+        if (false && printThisLoop) {
+          Serial.print("cool set temp: ");
+          Serial.println(t_final);
+        }
       }
     }
 
     // Use the appropriate PID parameters based on the current phase
     if (!soakComplete) myPID.SetTunings(Kp_soak, Ki_soak, Kd_soak);
-    else if (!reflowComplete) myPID.SetTunings(Kp_reflow, Ki_reflow, Kd_reflow);
-    
+    else if (!reflowBComplete) myPID.SetTunings(Kp_reflow, Ki_reflow, Kd_reflow);
+
     // Compute PID output (from 0 to windowSize) and control relay accordingly
     myPID.Compute(); // This will only be evaluated at the PID sampling rate
     if (millis() - windowStartTime >= windowSize) windowStartTime += windowSize; // Shift the time window
@@ -269,7 +400,20 @@ void loop() {
     previousMillis = millis();
     Serial.print("--> Temperature: "); // The right arrow means it's sending data out
     Serial.print(temperature);
-    Serial.println(" *C");
+    Serial.print(" *C; reflow? ");
+    Serial.print(reflow);
+    Serial.print("; preheat complete? ");
+    Serial.print(preheatComplete);
+    Serial.print("; soak complete? ");
+    Serial.print(soakComplete);
+    Serial.print("; stage wait? ");
+    Serial.print(stageWait);
+    Serial.print("; enum status? ");
+    Serial.print(currState);
+    //Serial.print("; relay? ");
+    //Serial.println(relay);
+    Serial.println("");
+
     if (!isnan(temperature)) { // Only send the temperature values if they're legit
       BT.print(dataChar); // This tells the app that it's data
       BT.print(String(temperature)); // Need to cast to String for the app to receive it properly
@@ -283,12 +427,12 @@ void loop() {
       }
     }
   }
-  
+
   // Check for an incoming command. If nothing was sent, return to loop()
   if (BT.available() < 1) return;
 
   request = BT.read();  // Read request
-//  Serial.print("REQUEST: "); Serial.println(request); // DEBUG
+  Serial.print("REQUEST: "); Serial.println(request); // DEBUG
 
   if (request == startReflow) { // Command from app to start reflow process
     justStarted = true;
